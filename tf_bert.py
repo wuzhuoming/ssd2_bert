@@ -124,7 +124,7 @@ def main(argv):
 
   #data loading
   train_df =  pd.read_csv('/root/cyliu/tftuner/selftf/tf_job/nlp/zmwu/bert_tf2/train.csv')
-  train_df = train_df.sample(10)
+  train_df = train_df.sample(1000)
   train, test = train_test_split(train_df, test_size = 0.1, random_state=42)
   train_lines, train_labels = train.question_text.values, train.target.values
   test_lines, test_labels = test.question_text.values, test.target.values
@@ -149,7 +149,7 @@ def main(argv):
   model_fn = run_classifier.model_fn_builder(
       bert_config=modeling.BertConfig.from_json_file(CONFIG_FILE),
       num_labels=len(label_list),
-      init_checkpoint=INIT_CHECKPOINT,
+      init_checkpoint=None,
       learning_rate=LEARNING_RATE,
       num_train_steps=num_train_steps,
       num_warmup_steps=num_warmup_steps,
