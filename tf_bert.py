@@ -21,12 +21,18 @@ import tokenization
 from tqdm import tqdm
 import time
 import shutil
-import nni
+from absl import flags, app
 import logging
+from selftf.lib.mltuner.mltuner_util import MLTunerUtil
 
-logging.basicConfig(level=logging.INFO)
-logging.getLogger().setLevel(logging.INFO)
 
+logging.basicConfig(level=logging.DEBUG,
+                    format='%(asctime)s %(name)-12s %(levelname)-8s %(message)s',
+                    datefmt='%m-%d %H:%M',
+                    )
+
+
+mltunerUtil = MLTunerUtil()
 
 def create_examples(lines, set_type, labels=None):
 #Generate data for the BERT model
@@ -86,185 +92,144 @@ def input_fn_builder(features, seq_length, is_training, drop_remainder):
     })
 
     if is_training:
+      d = d.shard(mltunerUtil.get_num_worker(),mltunerUtil.get_worker_index())
       d = d.repeat()
       d = d.shuffle(buffer_size=100)
-
-    d = d.batch(batch_size=batch_size, drop_remainder=drop_remainder)
+      d = d.batch(batch_size=batch_size, drop_remainder=drop_remainder)
+    else:
+      d = d.shard(mltunerUtil.get_num_worker(),mltunerUtil.get_worker_index())
+      d = d.batch(batch_size=batch_size, drop_remainder=drop_remainder)
     return d
 
   return input_fn
 
 
+def main(argv):
 
-BERT_MODEL = 'uncased_L-12_H-768_A-12'
-OUTPUT_DIR = '/research/d3/zmwu/model/nlp_bert/outputs'
-VOCAB_FILE = '/research/d3/zmwu/model/nlp_bert/vocab.txt'
-CONFIG_FILE = '/research/d3/zmwu/model/nlp_bert/bert_config.json'
-INIT_CHECKPOINT = '/research/d3/zmwu/model/nlp_bert/bert_model.ckpt'
-DO_LOWER_CASE = BERT_MODEL.startswith('uncased')
+  BERT_MODEL = 'uncased_L-12_H-768_A-12'
+  VOCAB_FILE = '/root/cyliu/tftuner/selftf/tf_job/nlp/zmwu/bert_tf2/vocab.txt'
+  CONFIG_FILE = '/root/cyliu/tftuner/selftf/tf_job/nlp/zmwu/bert_tf2/bert_config.json'
+  INIT_CHECKPOINT = '/root/cyliu/tftuner/selftf/tf_job/nlp/zmwu/bert_tf2/bert_model.ckpt'
+  DO_LOWER_CASE = BERT_MODEL.startswith('uncased')
+  model_dir = "{}/{}".format("/opt/tftuner", mltunerUtil.get_job_id())
 
-
-params = {
-  'respect':"respect",
-  'granularity':"core" ,
-  'type':"compact",
-  'permute':0,
-  'offset':0,
-  'KMP_BLOCKTIME':"200",
-  'OMP_NUM_THREADS':"2",
-  'MKL_DYNAMIC':"TRUE",
-
-  'inter_op_parallelism_threads':1,
-  'intra_op_parallelism_threads':2,
-  'do_common_subexpression_elimination':0,
-  'max_folded_constant_in_bytes':10000,
-  'do_function_inlining':0,
-  'global_jit_level':0,
-  'enable_bfloat16_sendrecv':0,
-  'infer_shapes':0,
-  'place_pruned_graph':0
-} 
+  # model fix parameter
+  TRAIN_BATCH_SIZE = mltunerUtil.get_batch_size()
+  NUM_TRAIN_EPOCHS = 3
+  LEARNING_RATE = mltunerUtil.get_learning_rate()
+  WARMUP_PROPORTION = 0.05
+  EVAL_BATCH_SIZE = 8
+  MAX_SEQ_LENGTH = 128
 
 
-tuned_params = nni.get_next_parameter() 
-params.update(tuned_params) 
-t_id = nni.get_trial_id()
+  #data loading
+  train_df =  pd.read_csv('/root/cyliu/tftuner/selftf/tf_job/nlp/zmwu/bert_tf2/train.csv')
+  train_df = train_df.sample(10)
+  train, test = train_test_split(train_df, test_size = 0.1, random_state=42)
+  train_lines, train_labels = train.question_text.values, train.target.values
+  test_lines, test_labels = test.question_text.values, test.target.values
+  label_list = ['0', '1']
+  tokenizer = tokenization.FullTokenizer(vocab_file=VOCAB_FILE, do_lower_case=DO_LOWER_CASE)
+  train_examples = create_examples(train_lines, 'train', labels=train_labels)
 
 
-#KMP hardware parameter
-os.environ["KMP_AFFINITY"] = "verbose,{respect},granularity={specifier},{type},{permute},{offset}".format(
-                                respect=params['respect'],
-                                specifier=params['granularity'],
-                                type=params['type'],
-                                permute=params['permute'],
-                                offset=params['offset'])
-os.environ["KMP_BLOCKTIME"] = params['KMP_BLOCKTIME']
-os.environ["OMP_NUM_THREADS"] = params['OMP_NUM_THREADS']
-os.environ["MKL_DYNAMIC"] = params['MKL_DYNAMIC']
-os.environ["KMP_SETTINGS"] = "TRUE"
+  num_train_steps = int(len(train_examples) / TRAIN_BATCH_SIZE * NUM_TRAIN_EPOCHS)
+  num_warmup_steps = int(num_train_steps * WARMUP_PROPORTION)
 
 
-# model fix parameter
-TRAIN_BATCH_SIZE = 16
-NUM_TRAIN_EPOCHS = 3
-LEARNING_RATE = 0.001
-WARMUP_PROPORTION = 0.05
-EVAL_BATCH_SIZE = 8
-MAX_SEQ_LENGTH = 128
-
-
-#data loading
-train_df =  pd.read_csv('/research/d3/zmwu/model/nlp_bert/train.csv')
-train_df = train_df.sample(1500)
-train, test = train_test_split(train_df, test_size = 0.1, random_state=42)
-train_lines, train_labels = train.question_text.values, train.target.values
-test_lines, test_labels = test.question_text.values, test.target.values
-label_list = ['0', '1']
-tokenizer = tokenization.FullTokenizer(vocab_file=VOCAB_FILE, do_lower_case=DO_LOWER_CASE)
-train_examples = create_examples(train_lines, 'train', labels=train_labels)
-
-if params['global_jit_level'] == 0:
-    global_jit_level = tf.compat.v1.OptimizerOptions.OFF
-elif params['global_jit_level'] == 1:
-    global_jit_level = tf.compat.v1.OptimizerOptions.ON_1
-else:
-    global_jit_level = tf.compat.v1.OptimizerOptions.ON_2
-
-my_config = tf.compat.v1.ConfigProto(
-    inter_op_parallelism_threads=int(params['inter_op_parallelism_threads']),
-    intra_op_parallelism_threads=int(params['intra_op_parallelism_threads']),
-    allow_soft_placement=True,
-    log_device_placement=False,
-    graph_options=tf.compat.v1.GraphOptions(
-        optimizer_options=tf.compat.v1.OptimizerOptions(
-            do_common_subexpression_elimination=bool(params['do_common_subexpression_elimination']),
-            do_constant_folding=True,
-            max_folded_constant_in_bytes=int(params['max_folded_constant_in_bytes']),
-            do_function_inlining=bool(params['do_function_inlining']),
-            opt_level=tf.compat.v1.OptimizerOptions.L0,
-            global_jit_level=global_jit_level
-        ),
-        enable_bfloat16_sendrecv=bool(params['enable_bfloat16_sendrecv']),
-        infer_shapes=bool(params['infer_shapes']),
-        place_pruned_graph=bool(params['place_pruned_graph'])
-    )
-)
-
-
-run_config = tf.compat.v1.estimator.tpu.RunConfig(
-    model_dir=OUTPUT_DIR,
+  strategy = tf.distribute.experimental.ParameterServerStrategy()
+  session_config = mltunerUtil.get_tf_session_config()
+  config = tf.compat.v1.estimator.tpu.RunConfig(
+    train_distribute=strategy,
+    model_dir=model_dir,
     save_checkpoints_steps=None,
     save_checkpoints_secs=None,
-    session_config=my_config)
+    session_config=session_config)
+
+  model_fn = run_classifier.model_fn_builder(
+      bert_config=modeling.BertConfig.from_json_file(CONFIG_FILE),
+      num_labels=len(label_list),
+      init_checkpoint=INIT_CHECKPOINT,
+      learning_rate=LEARNING_RATE,
+      num_train_steps=num_train_steps,
+      num_warmup_steps=num_warmup_steps,
+      use_tpu=False, #If False training will fall on CPU or GPU, depending on what is available  
+      use_one_hot_embeddings=True)
 
 
-num_train_steps = int(len(train_examples) / TRAIN_BATCH_SIZE * NUM_TRAIN_EPOCHS)
-num_warmup_steps = int(num_train_steps * WARMUP_PROPORTION)
+  estimator = tf.compat.v1.estimator.tpu.TPUEstimator(
+      use_tpu=False, #If False training will fall on CPU or GPU, depending on what is available 
+      model_fn=model_fn,
+      config=config,
+      train_batch_size=TRAIN_BATCH_SIZE,
+      eval_batch_size=EVAL_BATCH_SIZE)
+
+  class LoggerHook(tf.estimator.SessionRunHook):
+    """Logs loss and runtime."""
+
+    def __init__(self):
+        self.last_run_timestamp = time.time()
+    
+    def after_run(self, run_context, run_values):
+        session: tf.Session = run_context.session
+        loss, step = session.run([tf.compat.v1.get_collection("losses")[0],
+                                  tf.compat.v1.get_collection("global_step_read_op_cache")[0]])
+        logging.debug("step:{} loss:{}".format(step, loss))
+        mltunerUtil.report_iter_loss(step, loss,
+                                     time.time() - self.last_run_timestamp)
+        self.last_run_timestamp = time.time()
+
+  # prepare for train
+  train_features = run_classifier.convert_examples_to_features(train_examples, label_list, MAX_SEQ_LENGTH, tokenizer)
+  train_input_fn = input_fn_builder(
+      features=train_features,
+      seq_length=MAX_SEQ_LENGTH,
+      is_training=True,
+      drop_remainder=True)
+
+  predict_examples = create_examples(test_lines, 'test')
+  predict_features = run_classifier.convert_examples_to_features(predict_examples, label_list, MAX_SEQ_LENGTH, tokenizer)
+  predict_input_fn = input_fn_builder(
+      features=predict_features,
+      seq_length=MAX_SEQ_LENGTH,
+      is_training=False,
+      drop_remainder=False)
 
 
-model_fn = run_classifier.model_fn_builder(
-    bert_config=modeling.BertConfig.from_json_file(CONFIG_FILE),
-    num_labels=len(label_list),
-    init_checkpoint=INIT_CHECKPOINT,
-    learning_rate=LEARNING_RATE,
-    num_train_steps=num_train_steps,
-    num_warmup_steps=num_warmup_steps,
-    use_tpu=False, #If False training will fall on CPU or GPU, depending on what is available  
-    use_one_hot_embeddings=True)
+  # wait for chief ready?
+  if not (mltunerUtil.is_chief() or mltunerUtil.is_ps()):
+      time.sleep(1)
+      if not tf.io.gfile.exists(model_dir):
+          logging.debug("wait for chief init")
+          time.sleep(1)
 
 
-estimator = tf.compat.v1.estimator.tpu.TPUEstimator(
-    use_tpu=False, #If False training will fall on CPU or GPU, depending on what is available 
-    model_fn=model_fn,
-    config=run_config,
-    train_batch_size=TRAIN_BATCH_SIZE,
-    eval_batch_size=EVAL_BATCH_SIZE)
+  # start training
+  logging.info('***** Started training at {} *****'.format(datetime.datetime.now()))
+  logging.info('  Num examples = {}'.format(len(train_examples)))
+  logging.info('  Batch size = {}'.format(TRAIN_BATCH_SIZE))
+  logging.info("  Num steps = %d", num_train_steps)
+  estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
+  logging.info('***** Finished training at {} *****'.format(datetime.datetime.now()))
+
+  # start eval
+  result = estimator.predict(input_fn=predict_input_fn)
+  preds = []
+  for prediction in tqdm(result):
+      for class_probability in prediction['probabilities']:
+        preds.append(float(class_probability))
+  results = []
+  for i in tqdm(range(0,len(preds),2)):
+    if preds[i] < 0.9:
+      results.append(1)
+    else:
+      results.append(0)
+
+  # calculate the result:
+  logging.info("accuracy:{}".format(accuracy_score(np.array(results), test_labels)))
+  logging.info("f1_score:{}".format(f1_score(np.array(results), test_labels)))
 
 
-# prepare for train
-train_features = run_classifier.convert_examples_to_features(train_examples, label_list, MAX_SEQ_LENGTH, tokenizer)
-logging.info('***** Started training at {} *****'.format(datetime.datetime.now()))
-logging.info('  Num examples = {}'.format(len(train_examples)))
-logging.info('  Batch size = {}'.format(TRAIN_BATCH_SIZE))
-logging.info("  Num steps = %d", num_train_steps)
 
-
-##start train
-train_input_fn = run_classifier.input_fn_builder(
-    features=train_features,
-    seq_length=MAX_SEQ_LENGTH,
-    is_training=True,
-    drop_remainder=True)
-estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
-logging.info('***** Finished training at {} *****'.format(datetime.datetime.now()))
-
-
-#prepare for eval
-predict_examples = create_examples(test_lines, 'test')
-predict_features = run_classifier.convert_examples_to_features(predict_examples, label_list, MAX_SEQ_LENGTH, tokenizer)
-predict_input_fn = input_fn_builder(
-    features=predict_features,
-    seq_length=MAX_SEQ_LENGTH,
-    is_training=False,
-    drop_remainder=False)
-
-
-##eval
-result = estimator.predict(input_fn=predict_input_fn)
-preds = []
-for prediction in tqdm(result):
-    for class_probability in prediction['probabilities']:
-      preds.append(float(class_probability))
-results = []
-for i in tqdm(range(0,len(preds),2)):
-  if preds[i] < 0.9:
-    results.append(1)
-  else:
-    results.append(0)
-
-
-# calculate the result:
-logging.info(accuracy_score(np.array(results), test_labels))
-logging.info(f1_score(np.array(results), test_labels))
-final_acc = accuracy_score(np.array(results), test_labels)
-nni.report_final_result(float(final_acc))
+if __name__ == '__main__':
+  app.run(main)
