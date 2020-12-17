@@ -195,6 +195,8 @@ def main(argv):
       is_training=False,
       drop_remainder=False)
 
+  train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=num_train_steps,hooks=[LoggerHook()])
+  eval_spec = tf.estimator.EvalSpec(input_fn=predict_input_fn)
 
   # wait for chief ready?
   if not (mltunerUtil.is_chief() or mltunerUtil.is_ps()):
@@ -202,32 +204,32 @@ def main(argv):
       if not tf.io.gfile.exists(model_dir):
           logging.debug("wait for chief init")
           time.sleep(1)
+  tf.estimator.train_and_evaluate(estimator,train_spec,eval_spec)
 
+#   # start training
+#   logging.info('***** Started training at {} *****'.format(datetime.datetime.now()))
+#   logging.info('  Num examples = {}'.format(len(train_examples)))
+#   logging.info('  Batch size = {}'.format(TRAIN_BATCH_SIZE))
+#   logging.info("  Num steps = %d", num_train_steps)
+#   estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
+#   logging.info('***** Finished training at {} *****'.format(datetime.datetime.now()))
 
-  # start training
-  logging.info('***** Started training at {} *****'.format(datetime.datetime.now()))
-  logging.info('  Num examples = {}'.format(len(train_examples)))
-  logging.info('  Batch size = {}'.format(TRAIN_BATCH_SIZE))
-  logging.info("  Num steps = %d", num_train_steps)
-  estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
-  logging.info('***** Finished training at {} *****'.format(datetime.datetime.now()))
+#   # start eval
+#   result = estimator.predict(input_fn=predict_input_fn)
+#   preds = []
+#   for prediction in tqdm(result):
+#       for class_probability in prediction['probabilities']:
+#         preds.append(float(class_probability))
+#   results = []
+#   for i in tqdm(range(0,len(preds),2)):
+#     if preds[i] < 0.9:
+#       results.append(1)
+#     else:
+#       results.append(0)
 
-  # start eval
-  result = estimator.predict(input_fn=predict_input_fn)
-  preds = []
-  for prediction in tqdm(result):
-      for class_probability in prediction['probabilities']:
-        preds.append(float(class_probability))
-  results = []
-  for i in tqdm(range(0,len(preds),2)):
-    if preds[i] < 0.9:
-      results.append(1)
-    else:
-      results.append(0)
-
-  # calculate the result:
-  logging.info("accuracy:{}".format(accuracy_score(np.array(results), test_labels)))
-  logging.info("f1_score:{}".format(f1_score(np.array(results), test_labels)))
+#   # calculate the result:
+#   logging.info("accuracy:{}".format(accuracy_score(np.array(results), test_labels)))
+#   logging.info("f1_score:{}".format(f1_score(np.array(results), test_labels)))
 
 
 
